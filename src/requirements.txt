@@ -1,0 +1,12 @@
+# Core audio I/O
+sounddevice>=0.4.6
+
+# Scientific computing & DSP
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Visualization (for noise_analyzer.py)
+matplotlib>=3.7.0
+
+# Audio file I/O (for WAV recording in passthrough.py)
+soundfile>=0.12.0
