@@ -169,9 +169,3 @@ Press **Ctrl+C** in the terminal to stop.
 ## 🤝 Contributing
 
 This is a personal project in active development. If you have ideas for DSP algorithms, UI designs, or hardware integration, feel free to open an issue or pull request.
-
----
-
-## 📜 License
-
-MIT License — see [LICENSE](LICENSE) for details.
