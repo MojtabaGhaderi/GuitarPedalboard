@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Professional Guitar Pedalboard – with hysteresis gate and output recording.
-- Noise gate with separate open/close thresholds
-- Press 'r' to start/stop recording output to file (saved as guitar_YYYYMMDD_HHMMSS.wav)
-- All previous improvements: stateful cabinet convolution, fixed compressor, extra low-pass, etc.
+Professional Guitar Pedalboard – with hysteresis gate, output recording,
+spectral noise subtraction, and algorithmic reverb.
+
+Commands:
+  d, ae, drive, bass, treble, presence, gain, vol, makeup, blend,
+  notch, gate, gate_off, gate_on, comp, comp_off, comp_on,
+  loadir, r, q,
+  profile, sub_on, sub_off, sub_amount, sub_reset, sub_save, sub_load,
+  reverb, room, damp, wet, pre, reverb_off
 """
 
 import sounddevice as sd
@@ -15,6 +20,7 @@ import os
 from scipy.signal import butter, sosfilt, iirnotch, lfilter
 from datetime import datetime
 from noise_profiler import SpectralSubtractor
+from reverb import Freeverb
 
 try:
     import soundfile as sf
@@ -26,7 +32,7 @@ except ImportError:
 # ========== Audio Settings ==========
 SAMPLE_RATE = 44100
 BLOCK_SIZE = 512
-LATENCY = 'high'          # change to 'low' if CPU permits
+LATENCY = 'high'
 
 # ========== Effect Parameters ==========
 GAIN = 0.6
@@ -42,14 +48,14 @@ ACOUSTIC_TO_ELECTRIC = False
 
 # Noise Gate with Hysteresis
 NOISE_GATE_ENABLED = True
-NOISE_GATE_OPEN_THRESHOLD = 0.008     # RMS level to open gate (higher than close)
-NOISE_GATE_CLOSE_THRESHOLD = 0.004    # RMS level to close gate (lower, prevents chatter)
+NOISE_GATE_OPEN_THRESHOLD = 0.008
+NOISE_GATE_CLOSE_THRESHOLD = 0.004
 NOISE_GATE_ATTACK_MS = 5
 NOISE_GATE_RELEASE_MS = 80
 gate_gain = 0.0
 attack_coef = 0.0
 release_coef = 0.0
-gate_state = 'closed'                 # 'open' or 'closed'
+gate_state = 'closed'
 
 # Compressor
 COMPRESSOR_ENABLED = True
@@ -65,17 +71,21 @@ comp_release_coef = 0.0
 # Output recording
 RECORDING = False
 RECORDINGS_DIR = "../recordings"
-record_buffer = []        # list of numpy arrays (block data)
-record_file = None
-
+record_buffer = []
 
 # ========== Spectral Noise Subtraction ==========
-subtractor = SpectralSubtractor(fft_size=2048, hop_size=BLOCK_SIZE, sample_rate=SAMPLE_RATE, profile_dir="profiles")
-subtractor.load_profile()  # auto-load if noise_profile.npz exists
+subtractor = SpectralSubtractor(
+    fft_size=2048, hop_size=BLOCK_SIZE,
+    sample_rate=SAMPLE_RATE, profile_dir="profiles"
+)
+subtractor.load_profile()
 
 PROFILING = False
 PROFILE_BLOCKS = []
 PROFILE_TARGET_SECONDS = 3.0
+
+# ========== Reverb ==========
+reverb = Freeverb(sample_rate=SAMPLE_RATE, block_size=BLOCK_SIZE)
 
 # ========== Filter Design ==========
 def design_hp(cutoff, fs, order=2):
@@ -175,7 +185,7 @@ def peaking_eq(x, freq, gain_db, q, state):
     y, new_state = lfilter(b, a, x, zi=state)
     return y, new_state
 
-# ========== Cabinet Impulse Response (Stateful Convolution) ==========
+# ========== Cabinet Impulse Response ==========
 CAB_IR = None
 cab_delay_line = None
 
@@ -201,7 +211,7 @@ def load_cabinet_ir(path="cabinet.wav", max_len=512):
             return
         except:
             pass
-    # Synthetic IR: simple resonant low‑pass
+    # Synthetic IR
     b, a = butter(2, 4000, btype='low', fs=SAMPLE_RATE, output='ba')
     ir = np.zeros(max_len)
     ir[0] = 1.0
@@ -246,27 +256,25 @@ update_gate_coefficients()
 def apply_noise_gate(x):
     global gate_gain, gate_state
     rms = np.sqrt(np.mean(x**2) + 1e-10)
-    # Hysteresis logic
     if gate_state == 'closed':
         if rms > NOISE_GATE_OPEN_THRESHOLD:
             gate_state = 'open'
             target = 1.0
         else:
             target = 0.0
-    else:  # 'open'
+    else:
         if rms < NOISE_GATE_CLOSE_THRESHOLD:
             gate_state = 'closed'
             target = 0.0
         else:
             target = 1.0
-    # Smooth gain
     if target > gate_gain:
         gate_gain = attack_coef * gate_gain + (1 - attack_coef) * target
     else:
         gate_gain = release_coef * gate_gain + (1 - release_coef) * target
     return x * gate_gain
 
-# ========== Compressor (Fixed Logic) ==========
+# ========== Compressor ==========
 def update_comp_coefficients():
     global comp_attack_coef, comp_release_coef
     comp_attack_coef = np.exp(-1.0 / (COMP_ATTACK_MS * 0.001 * SAMPLE_RATE))
@@ -277,7 +285,6 @@ update_comp_coefficients()
 def apply_compressor(x):
     global comp_gain, comp_state
     peak = np.max(np.abs(x))
-    # Smooth envelope
     if peak > comp_state:
         comp_state = comp_attack_coef * comp_state + (1 - comp_attack_coef) * peak
     else:
@@ -288,7 +295,6 @@ def apply_compressor(x):
         target_gain = 10 ** (-reduction_db / 20)
     else:
         target_gain = 1.0
-    # Attack when gain reduces (target_gain < comp_gain)
     if target_gain < comp_gain:
         comp_gain = comp_attack_coef * comp_gain + (1 - comp_attack_coef) * target_gain
     else:
@@ -314,13 +320,10 @@ def stop_recording():
         print("No audio captured.")
         RECORDING = False
         return
-    # Concatenate all recorded blocks
     audio = np.concatenate(record_buffer, axis=0)
-    # Generate filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"guitar_{timestamp}.wav"
     filepath = os.path.join(RECORDINGS_DIR, filename)
-
     if HAS_SOUNDFILE:
         sf.write(filepath, audio, SAMPLE_RATE)
         print(f"Recording saved to {filepath}")
@@ -335,22 +338,19 @@ input_peak = 0.0
 # ========== Audio Callback ==========
 def callback(indata, outdata, frames, time, status):
     global hp_zi, lp_zi, ae_lp_zi, input_peak, ae_eq_state, post_cab_lp_zi
-    global RECORDING, record_buffer
-    global PROFILING
+    global RECORDING, record_buffer, PROFILING
     if status:
         print(f"Status: {status}", flush=True)
 
     x = indata[:, 0].copy() if indata.shape[1] >= 1 else np.zeros(frames)
 
-    # Profiling: capture raw input before any gain/effects
+    # Profiling
     if PROFILING:
         PROFILE_BLOCKS.append(x.copy())
-
 
     # Spectral subtraction (on raw signal)
     if subtractor.enabled:
         x = subtractor.process(x)
-
 
     # Input peak meter
     peak = np.max(np.abs(x))
@@ -359,11 +359,11 @@ def callback(indata, outdata, frames, time, status):
     # Clean gain
     x = x * GAIN
 
-    # Noise gate (first)
+    # Noise gate
     if NOISE_GATE_ENABLED:
         x = apply_noise_gate(x)
 
-    # Compressor (before distortion)
+    # Compressor
     if COMPRESSOR_ENABLED:
         x = apply_compressor(x)
 
@@ -389,13 +389,18 @@ def callback(indata, outdata, frames, time, status):
         dry = dry * GAIN * CLEAN_BLEND
         x = x * (1 - CLEAN_BLEND) + dry
 
+    # ========== REVERB ==========
+    # Apply after distortion, before master volume
+    if reverb.enabled:
+        x = reverb.process(x)
+
     # Master volume and safety clip
     x = x * MASTER_VOLUME
     x = np.clip(x, -0.99, 0.99)
 
     outdata[:] = x.reshape(-1, 1)
 
-    # Recording if enabled
+    # Recording
     if RECORDING:
         record_buffer.append(x.copy())
 
@@ -406,8 +411,7 @@ def input_listener():
     global hp_sos, lp_sos, hp_zi, lp_zi, stage1_zi, stage2_zi, ae_lp_zi
     global notch_filters, ae_eq_state, presence_state, NOISE_GATE_ENABLED
     global NOISE_GATE_OPEN_THRESHOLD, NOISE_GATE_CLOSE_THRESHOLD
-    global COMPRESSOR_ENABLED, COMP_THRESHOLD_DB
-    global PROFILING
+    global COMPRESSOR_ENABLED, COMP_THRESHOLD_DB, PROFILING
 
     while True:
         try:
@@ -418,6 +422,8 @@ def input_listener():
             continue
         parts = line.split()
         cmd = parts[0].lower()
+
+        # --- Distortion ---
         if cmd == 'd':
             DISTORTION_ENABLED = not DISTORTION_ENABLED
             print(f"Overdrive {'ON' if DISTORTION_ENABLED else 'OFF'}")
@@ -453,6 +459,8 @@ def input_listener():
         elif cmd == 'blend' and len(parts) > 1:
             CLEAN_BLEND = max(0.0, min(1.0, float(parts[1])))
             print(f"Clean blend = {CLEAN_BLEND:.2f}")
+
+        # --- Notch ---
         elif cmd == 'notch' and len(parts) > 1:
             try:
                 freq = float(parts[1])
@@ -465,11 +473,12 @@ def input_listener():
                     print(f"Notch filter: {freq} Hz, Q={q}")
             except:
                 print("Usage: notch freq [Q]")
+
+        # --- Gate ---
         elif cmd == 'gate' and len(parts) > 1:
             try:
                 val = float(parts[1])
                 NOISE_GATE_OPEN_THRESHOLD = max(0.0, min(0.5, val))
-                # Set close threshold to half of open by default
                 NOISE_GATE_CLOSE_THRESHOLD = NOISE_GATE_OPEN_THRESHOLD * 0.5
                 print(f"Gate open={NOISE_GATE_OPEN_THRESHOLD:.4f}, close={NOISE_GATE_CLOSE_THRESHOLD:.4f}")
             except:
@@ -480,6 +489,8 @@ def input_listener():
         elif cmd == 'gate_on':
             NOISE_GATE_ENABLED = True
             print("Noise gate ON")
+
+        # --- Compressor ---
         elif cmd == 'comp' and len(parts) > 1:
             try:
                 val = float(parts[1])
@@ -493,62 +504,91 @@ def input_listener():
         elif cmd == 'comp_on':
             COMPRESSOR_ENABLED = True
             print("Compressor ON")
+
+        # --- Cabinet ---
         elif cmd == 'loadir':
             load_cabinet_ir()
+
+        # --- Recording ---
         elif cmd == 'r':
             if not RECORDING:
                 start_recording()
             else:
                 stop_recording()
-        elif cmd == 'q':
-            print("Quitting...")
-            sys.exit(0)
-        
+
+        # --- Spectral Subtraction ---
         elif cmd == 'profile':
             if not PROFILING:
+                global PROFILE_BLOCKS
                 PROFILE_BLOCKS = []
                 PROFILING = True
                 print(f"Profiling: keep silence for {PROFILE_TARGET_SECONDS}s...")
             else:
                 print("Profiling already running")
-
         elif cmd == 'sub_on':
             subtractor.enabled = True
             subtractor.reset()
             print("Spectral subtraction ON")
-
         elif cmd == 'sub_off':
             subtractor.enabled = False
             print("Spectral subtraction OFF")
-
         elif cmd == 'sub_amount' and len(parts) > 1:
             subtractor.amount = max(0.0, min(3.0, float(parts[1])))
             print(f"Subtraction amount = {subtractor.amount:.2f}")
-
         elif cmd == 'sub_reset':
             subtractor.reset()
             print("Subtractor buffers reset")
-
         elif cmd == 'sub_save':
             subtractor.save_profile()
-
         elif cmd == 'sub_load':
             subtractor.load_profile()
+
+        # --- REVERB ---
+        elif cmd == 'reverb':
+            reverb.enabled = not reverb.enabled
+            if reverb.enabled:
+                reverb.reset()
+            print(f"Reverb {'ON' if reverb.enabled else 'OFF'}")
+        elif cmd == 'room' and len(parts) > 1:
+            reverb.set_room_size(float(parts[1]))
+            print(f"Room size = {reverb.room_size:.2f}")
+        elif cmd == 'damp' and len(parts) > 1:
+            reverb.set_damping(float(parts[1]))
+            print(f"Damping = {reverb.damping:.2f}")
+        elif cmd == 'wet' and len(parts) > 1:
+            reverb.set_wet(float(parts[1]))
+            print(f"Wet mix = {reverb.wet:.2f}")
+        elif cmd == 'pre' and len(parts) > 1:
+            reverb.set_pre_delay(float(parts[1]))
+            print(f"Pre-delay = {reverb.pre_delay_ms:.0f} ms")
+        elif cmd == 'reverb_status':
+            print(reverb.status())
+
+        # --- Quit ---
+        elif cmd == 'q':
+            print("Quitting...")
+            sys.exit(0)
+
         else:
-            print("Commands: d, ae, drive, bass, treble, presence, gain, vol, makeup, blend, notch, gate, gate_off, gate_on, comp, comp_off, comp_on, loadir, r, q")
+            print("Commands: d, ae, drive, bass, treble, presence, gain, vol, makeup, blend,")
+            print("          notch, gate, gate_off, gate_on, comp, comp_off, comp_on,")
+            print("          loadir, r, profile, sub_on, sub_off, sub_amount, sub_reset,")
+            print("          sub_save, sub_load, reverb, room, damp, wet, pre, reverb_status, q")
+
 
 def main():
     print("Available audio devices:")
     print(sd.query_devices())
     print("\nOpening stream...")
     load_cabinet_ir()
-    global PROFILING
+    global PROFILING, PROFILE_BLOCKS
+
     listener_thread = threading.Thread(target=input_listener, daemon=True)
     listener_thread.start()
 
     try:
         with sd.Stream(
-            device='pipewire',   # or 'default'
+            device='pipewire',
             samplerate=SAMPLE_RATE,
             blocksize=BLOCK_SIZE,
             channels=1,
@@ -556,23 +596,20 @@ def main():
             latency=LATENCY
         ) as stream:
             print(f"✅ Stream active: {int(stream.samplerate)} Hz, {stream.blocksize} samples/block")
-            print("Ultimate Guitar Pedalboard – with hysteresis gate and recording")
-            print("   • Noise gate: hysteresis (open/close thresholds)")
-            print("   • Press 'r' to start/stop recording output to WAV")
-            print("Commands: d, ae, drive, bass, treble, presence, gain, vol, makeup, blend, notch, gate, comp, loadir, r, q\n")
+            print("Ultimate Guitar Pedalboard")
+            print("Commands: d, ae, drive, bass, treble, presence, gain, vol, makeup, blend,")
+            print("          notch, gate, comp, loadir, r, profile, sub_on, reverb, room, damp, wet, pre, q\n")
             while True:
-                print("here and:")
-                try:
-                    print(PROFILING)
-                except:
-                    print("coulndt")
                 time.sleep(0.5)
+
+                # Auto-finish profiling
                 if PROFILING and len(PROFILE_BLOCKS) >= int(PROFILE_TARGET_SECONDS * SAMPLE_RATE / BLOCK_SIZE):
                     PROFILING = False
                     subtractor.record_profile(PROFILE_BLOCKS)
                     subtractor.save_profile()
-                    print("Profiling complete. Type 'sub on' to enable.")
-                print(f"Input peak: {input_peak:.3f} (aim 0.3-0.8) | Gate state: {'OPEN' if gate_gain>0.5 else 'CLOS'}", end='\r')
+                    print("Profiling complete. Type 'sub_on' to enable.")
+
+                print(f"Input peak: {input_peak:.3f} (aim 0.3-0.8) | Gate: {'OPEN' if gate_gain>0.5 else 'CLOS'} | {reverb.status()}", end='\r')
                 sys.stdout.flush()
     except KeyboardInterrupt:
         print("\nStopped.")
