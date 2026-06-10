@@ -14,6 +14,7 @@ import sys
 import os
 from scipy.signal import butter, sosfilt, iirnotch, lfilter
 from datetime import datetime
+from noise_profiler import SpectralSubtractor
 
 try:
     import soundfile as sf
@@ -66,6 +67,15 @@ RECORDING = False
 RECORDINGS_DIR = "../recordings"
 record_buffer = []        # list of numpy arrays (block data)
 record_file = None
+
+
+# ========== Spectral Noise Subtraction ==========
+subtractor = SpectralSubtractor(fft_size=2048, hop_size=BLOCK_SIZE, sample_rate=SAMPLE_RATE, profile_dir="profiles")
+subtractor.load_profile()  # auto-load if noise_profile.npz exists
+
+PROFILING = False
+PROFILE_BLOCKS = []
+PROFILE_TARGET_SECONDS = 3.0
 
 # ========== Filter Design ==========
 def design_hp(cutoff, fs, order=2):
@@ -326,10 +336,21 @@ input_peak = 0.0
 def callback(indata, outdata, frames, time, status):
     global hp_zi, lp_zi, ae_lp_zi, input_peak, ae_eq_state, post_cab_lp_zi
     global RECORDING, record_buffer
+    global PROFILING
     if status:
         print(f"Status: {status}", flush=True)
 
     x = indata[:, 0].copy() if indata.shape[1] >= 1 else np.zeros(frames)
+
+    # Profiling: capture raw input before any gain/effects
+    if PROFILING:
+        PROFILE_BLOCKS.append(x.copy())
+
+
+    # Spectral subtraction (on raw signal)
+    if subtractor.enabled:
+        x = subtractor.process(x)
+
 
     # Input peak meter
     peak = np.max(np.abs(x))
@@ -386,6 +407,7 @@ def input_listener():
     global notch_filters, ae_eq_state, presence_state, NOISE_GATE_ENABLED
     global NOISE_GATE_OPEN_THRESHOLD, NOISE_GATE_CLOSE_THRESHOLD
     global COMPRESSOR_ENABLED, COMP_THRESHOLD_DB
+    global PROFILING
 
     while True:
         try:
@@ -481,6 +503,37 @@ def input_listener():
         elif cmd == 'q':
             print("Quitting...")
             sys.exit(0)
+        
+        elif cmd == 'profile':
+            if not PROFILING:
+                PROFILE_BLOCKS = []
+                PROFILING = True
+                print(f"Profiling: keep silence for {PROFILE_TARGET_SECONDS}s...")
+            else:
+                print("Profiling already running")
+
+        elif cmd == 'sub_on':
+            subtractor.enabled = True
+            subtractor.reset()
+            print("Spectral subtraction ON")
+
+        elif cmd == 'sub_off':
+            subtractor.enabled = False
+            print("Spectral subtraction OFF")
+
+        elif cmd == 'sub_amount' and len(parts) > 1:
+            subtractor.amount = max(0.0, min(3.0, float(parts[1])))
+            print(f"Subtraction amount = {subtractor.amount:.2f}")
+
+        elif cmd == 'sub_reset':
+            subtractor.reset()
+            print("Subtractor buffers reset")
+
+        elif cmd == 'sub_save':
+            subtractor.save_profile()
+
+        elif cmd == 'sub_load':
+            subtractor.load_profile()
         else:
             print("Commands: d, ae, drive, bass, treble, presence, gain, vol, makeup, blend, notch, gate, gate_off, gate_on, comp, comp_off, comp_on, loadir, r, q")
 
@@ -489,7 +542,7 @@ def main():
     print(sd.query_devices())
     print("\nOpening stream...")
     load_cabinet_ir()
-
+    global PROFILING
     listener_thread = threading.Thread(target=input_listener, daemon=True)
     listener_thread.start()
 
@@ -508,7 +561,17 @@ def main():
             print("   • Press 'r' to start/stop recording output to WAV")
             print("Commands: d, ae, drive, bass, treble, presence, gain, vol, makeup, blend, notch, gate, comp, loadir, r, q\n")
             while True:
+                print("here and:")
+                try:
+                    print(PROFILING)
+                except:
+                    print("coulndt")
                 time.sleep(0.5)
+                if PROFILING and len(PROFILE_BLOCKS) >= int(PROFILE_TARGET_SECONDS * SAMPLE_RATE / BLOCK_SIZE):
+                    PROFILING = False
+                    subtractor.record_profile(PROFILE_BLOCKS)
+                    subtractor.save_profile()
+                    print("Profiling complete. Type 'sub on' to enable.")
                 print(f"Input peak: {input_peak:.3f} (aim 0.3-0.8) | Gate state: {'OPEN' if gate_gain>0.5 else 'CLOS'}", end='\r')
                 sys.stdout.flush()
     except KeyboardInterrupt:

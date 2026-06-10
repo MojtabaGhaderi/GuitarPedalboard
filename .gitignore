@@ -3,6 +3,7 @@
 
 # Recordings directory
 recordings/
+profiles/
 
 # Python cache
 __pycache__/
